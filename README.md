@@ -4,7 +4,7 @@ A Rust HTTP proxy that routes traffic either directly to local targets or via an
 
 ## Features
 
-- **Smart routing**: Resolves each request's target host via DNS and checks if the resulting IP falls within configured CIDR ranges. Traffic to local ranges is handled directly; all other traffic is forwarded to an upstream HTTP proxy.
+- **Smart routing**: Checks if the request's target is an IP address literal and whether it falls within configured CIDR ranges. Traffic to local IP ranges is handled directly; DNS-name targets and all other traffic are forwarded to an upstream HTTP proxy.
 - **CONNECT tunneling**: Supports both plain HTTP proxy requests and HTTP CONNECT tunnels (used by HTTPS).
 - **Multi-service**: A single process can host multiple independent proxy services (each with its own listen address, IP ranges, and upstream proxy).
 - **Async & fast**: Built on [Tokio](https://tokio.rs/) and [Hyper v1](https://hyper.rs/).
@@ -58,6 +58,6 @@ cargo build --release
 ## How it works
 
 1. A client sends a request to Mixer (either a plain `GET http://host/path` or a `CONNECT host:443`).
-2. Mixer resolves the target host via DNS.
-3. If any resolved IP is inside one of the `local_ranges`, Mixer connects **directly** to the target.
-4. Otherwise, Mixer forwards the request to the configured `upstream_proxy`.
+2. Mixer checks whether the target host is an **IP address literal**.
+3. If it is an IP and that IP falls inside one of the `local_ranges`, Mixer connects **directly** to the target.
+4. Otherwise (hostname target, or IP outside all ranges), Mixer forwards the request to the configured `upstream_proxy`.

@@ -10,7 +10,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use crate::config::ServiceConfig;
 use crate::error::ProxyError;
 
@@ -66,31 +66,15 @@ fn parse_proxy_url(url: &str) -> Result<(String, u16), ProxyError> {
     parse_host_port(url)
 }
 
-/// Resolve a hostname/IP string to a list of IP addresses.
-async fn resolve_host(host: &str) -> Vec<IpAddr> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return vec![ip];
+/// Check if the host is an IP literal that falls within any of the configured
+/// local CIDR ranges.  If the host is a DNS name (not an IP literal) this
+/// returns `false` immediately so the request is forwarded to the upstream
+/// proxy unchanged.
+fn is_ip_in_local_range(host: &str, ranges: &[ipnet::IpNet]) -> bool {
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ranges.iter().any(|r| r.contains(&ip)),
+        Err(_) => false,
     }
-    match tokio::net::lookup_host(format!("{}:0", host)).await {
-        Ok(addrs) => addrs.map(|a| a.ip()).collect(),
-        Err(e) => {
-            warn!("DNS resolution failed for {}: {}", host, e);
-            vec![]
-        }
-    }
-}
-
-/// Check if a host resolves to an IP in any of the configured local ranges.
-async fn is_in_local_range(host: &str, ranges: &[ipnet::IpNet]) -> bool {
-    let ips = resolve_host(host).await;
-    for ip in &ips {
-        for range in ranges {
-            if range.contains(ip) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 pub async fn run_service(config: ServiceConfig) -> Result<(), BoxError> {
@@ -151,7 +135,7 @@ async fn handle_connect(
     let (host, port) = parse_host_port(&host_port)
         .map_err(|e| -> BoxError { Box::new(e) })?;
 
-    let local = is_in_local_range(&host, &config.local_ranges).await;
+    let local = is_ip_in_local_range(&host, &config.local_ranges);
     let upstream_proxy = config.upstream_proxy.clone();
 
     tokio::spawn(async move {
@@ -243,7 +227,7 @@ async fn handle_http(
     };
     let port = uri.port_u16().unwrap_or(80);
 
-    let local = is_in_local_range(&host, &config.local_ranges).await;
+    let local = is_ip_in_local_range(&host, &config.local_ranges);
 
     if local {
         info!(peer = %peer_addr, target = %uri, "HTTP: routing directly");
