@@ -6,8 +6,6 @@ pub enum ProxyError {
     Io(#[from] std::io::Error),
     #[error("HTTP error: {0}")]
     Hyper(#[from] hyper::Error),
-    #[error("HTTP (util) error: {0}")]
-    HyperUtil(#[from] hyper_util::client::legacy::Error),
     #[error("Invalid configuration: {0}")]
     Config(String),
     #[error("Bad request: {0}")]

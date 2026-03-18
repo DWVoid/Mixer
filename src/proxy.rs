@@ -105,7 +105,6 @@ pub async fn run_service(config: ServiceConfig) -> Result<(), BoxError> {
             let io = TokioIo::new(stream);
             let result = http1_server::Builder::new()
                 .preserve_header_case(true)
-                .title_case_headers(true)
                 .serve_connection(
                     io,
                     service_fn(move |req| handle_request(req, config.clone(), peer_addr)),
@@ -261,7 +260,6 @@ async fn forward_http_direct(
 
     let (mut sender, conn) = http1_client::Builder::new()
         .preserve_header_case(true)
-        .title_case_headers(true)
         .handshake(io)
         .await?;
 
@@ -314,7 +312,6 @@ async fn forward_http_via_proxy(
 
     let (mut sender, conn) = http1_client::Builder::new()
         .preserve_header_case(true)
-        .title_case_headers(true)
         .handshake(io)
         .await?;
 
