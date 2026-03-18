@@ -2,6 +2,7 @@
 name = "mixer"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 description = "HTTP proxy mixer – routes traffic to local targets or an upstream proxy based on IP ranges"
 
 [[bin]]

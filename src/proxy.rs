@@ -36,6 +36,9 @@ fn error_response(status: StatusCode, msg: &str) -> Response<RespBody> {
 }
 
 /// Parse "host:port" into (host, port).
+/// Supports bracketed IPv6 addresses (e.g. `[::1]:443`).
+/// Note: unbracketed bare IPv6 addresses (e.g. `::1:443`) are not valid in
+/// HTTP/1.1 Host headers and are not supported here.
 fn parse_host_port(host_port: &str) -> Result<(String, u16), ProxyError> {
     // Handle IPv6 [::1]:443
     if host_port.starts_with('[') {
@@ -217,7 +220,9 @@ async fn connect_upstream_tunnel(host: &str, port: u16, upstream_proxy: &str) ->
     let resp = sender.send_request(connect_req).await?;
 
     if resp.status() != StatusCode::OK {
-        return Err(format!("Upstream proxy CONNECT failed: {}", resp.status()).into());
+        return Err(Box::new(ProxyError::UpstreamProxy(
+            format!("CONNECT to {}:{} failed with status {}", host, port, resp.status())
+        )));
     }
 
     let upgraded = hyper::upgrade::on(resp).await?;
@@ -281,8 +286,11 @@ async fn forward_http_direct(
 
     let headers = builder.headers_mut().unwrap();
     for (name, value) in &parts.headers {
-        let lower = name.as_str().to_ascii_lowercase();
-        if lower == "proxy-authorization" || lower == "proxy-connection" || lower == "proxy-authenticate" {
+        let lower = name.as_str();
+        if lower.eq_ignore_ascii_case("proxy-authorization")
+            || lower.eq_ignore_ascii_case("proxy-connection")
+            || lower.eq_ignore_ascii_case("proxy-authenticate")
+        {
             continue;
         }
         headers.insert(name.clone(), value.clone());

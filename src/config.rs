@@ -19,7 +19,7 @@ pub struct ServiceConfig {
     pub upstream_proxy: String,
 }
 
-pub async fn load(path: &Path) -> Result<Config, ProxyError> {
+pub async fn load(path: &Path) -> crate::error::Result<Config> {
     let content = fs::read_to_string(path).await
         .map_err(|e| ProxyError::Config(format!("Cannot read config file {}: {}", path.display(), e)))?;
     serde_json::from_str(&content)
