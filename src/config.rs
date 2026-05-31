@@ -5,18 +5,26 @@ use tokio::fs;
 use crate::error::ProxyError;
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct Config {
-    pub services: Vec<ServiceConfig>,
+pub struct ServiceConfig {
+    pub listen: String,
+    pub local_ranges: Vec<IpNet>,
+    pub upstream_proxy: String,
+    #[serde(default)]
+    pub tls: bool,
+    #[serde(default)]
+    pub tls_exclude: Vec<IpNet>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TlsConfig {
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct ServiceConfig {
-    /// Address to listen on, e.g. "0.0.0.0:8080"
-    pub listen: String,
-    /// CIDR ranges that should be proxied directly (locally)
-    pub local_ranges: Vec<IpNet>,
-    /// URL of the upstream HTTP proxy for traffic outside local_ranges, e.g. "http://proxy.corp:3128"
-    pub upstream_proxy: String,
+pub struct Config {
+    pub tls: Option<TlsConfig>,
+    pub services: Vec<ServiceConfig>,
 }
 
 pub async fn load(path: &Path) -> crate::error::Result<Config> {

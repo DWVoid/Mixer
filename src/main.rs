@@ -6,6 +6,7 @@ use tracing_subscriber::EnvFilter;
 mod config;
 mod error;
 mod proxy;
+mod tls;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -48,10 +49,15 @@ async fn main() {
 
     info!("Starting {} proxy service(s)", cfg.services.len());
 
+    let tls_config = cfg.tls;
+
     let handles: Vec<_> = cfg
         .services
         .into_iter()
-        .map(|svc| tokio::spawn(proxy::run_service(svc)))
+        .map(|svc| {
+            let tls = tls_config.clone();
+            tokio::spawn(proxy::run_service(svc, tls))
+        })
         .collect();
 
     for handle in handles {

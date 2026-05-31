@@ -10,9 +10,11 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
 use crate::config::ServiceConfig;
 use crate::error::ProxyError;
+use crate::tls;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type RespBody = BoxBody<Bytes, BoxError>;
@@ -35,12 +37,7 @@ fn error_response(status: StatusCode, msg: &str) -> Response<RespBody> {
         .unwrap()
 }
 
-/// Parse "host:port" into (host, port).
-/// Supports bracketed IPv6 addresses (e.g. `[::1]:443`).
-/// Note: unbracketed bare IPv6 addresses (e.g. `::1:443`) are not valid in
-/// HTTP/1.1 Host headers and are not supported here.
 fn parse_host_port(host_port: &str) -> Result<(String, u16), ProxyError> {
-    // Handle IPv6 [::1]:443
     if host_port.starts_with('[') {
         if let Some(bracket_end) = host_port.find(']') {
             let host = host_port[1..bracket_end].to_string();
@@ -60,16 +57,11 @@ fn parse_host_port(host_port: &str) -> Result<(String, u16), ProxyError> {
     Ok((host, port))
 }
 
-/// Parse proxy URL like "http://host:port" into (host, port).
 fn parse_proxy_url(url: &str) -> Result<(String, u16), ProxyError> {
     let url = url.trim_start_matches("http://").trim_start_matches("https://");
     parse_host_port(url)
 }
 
-/// Check if the host is an IP literal that falls within any of the configured
-/// local CIDR ranges.  If the host is a DNS name (not an IP literal) this
-/// returns `false` immediately so the request is forwarded to the upstream
-/// proxy unchanged.
 fn is_ip_in_local_range(host: &str, ranges: &[ipnet::IpNet]) -> bool {
     match host.parse::<IpAddr>() {
         Ok(ip) => ranges.iter().any(|r| r.contains(&ip)),
@@ -77,10 +69,49 @@ fn is_ip_in_local_range(host: &str, ranges: &[ipnet::IpNet]) -> bool {
     }
 }
 
-pub async fn run_service(config: ServiceConfig) -> Result<(), BoxError> {
+fn maybe_map_v4(ip: &IpAddr) -> IpAddr {
+    if let IpAddr::V6(v6) = ip {
+        if let Some(v4) = v6.to_ipv4_mapped() {
+            return IpAddr::V4(v4);
+        }
+    }
+    *ip
+}
+
+async fn build_acceptor(tls_cfg: &crate::config::TlsConfig) -> std::result::Result<TlsAcceptor, BoxError> {
+    let cert_path = tls_cfg.cert_path.as_ref().map(|s| std::path::Path::new(s.as_str()));
+    let key_path = tls_cfg.key_path.as_ref().map(|s| std::path::Path::new(s.as_str()));
+    if cert_path.is_none() != key_path.is_none() {
+        return Err(Box::new(ProxyError::Config(
+            "tls.cert_path and tls.key_path must be specified together".into(),
+        )));
+    }
+    let (cert, key) = tls::load_or_generate(cert_path, key_path).await?;
+    let acceptor = tls::build_tls_acceptor(&cert, &key)?;
+    Ok(acceptor)
+}
+
+pub async fn run_service(
+    config: ServiceConfig,
+    shared_tls: Option<crate::config::TlsConfig>,
+) -> Result<(), BoxError> {
+    let acceptor = if config.tls {
+        match shared_tls {
+            Some(ref cfg) => Some(build_acceptor(cfg).await?),
+            None => return Err(Box::new(ProxyError::Config(
+                "service has tls: true but no top-level tls config block".into(),
+            ))),
+        }
+    } else {
+        None
+    };
+
     let listener = TcpListener::bind(&config.listen).await
         .map_err(|e| format!("Failed to bind {}: {}", config.listen, e))?;
-    info!("Proxy service listening on {} (upstream: {})", config.listen, config.upstream_proxy);
+    info!(
+        "Proxy service listening on {} (upstream: {}, tls: {})",
+        config.listen, config.upstream_proxy, config.tls
+    );
 
     let config = Arc::new(config);
 
@@ -88,21 +119,57 @@ pub async fn run_service(config: ServiceConfig) -> Result<(), BoxError> {
         let (stream, peer_addr) = listener.accept().await?;
         let config = config.clone();
 
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let result = http1_server::Builder::new()
-                .preserve_header_case(true)
-                .serve_connection(
-                    io,
-                    service_fn(move |req| handle_request(req, config.clone(), peer_addr)),
-                )
-                .with_upgrades()
-                .await;
+        let raw_ip = peer_addr.ip();
+        let check_ip = maybe_map_v4(&raw_ip);
+        let excluded = config.tls_exclude.iter().any(|r| r.contains(&check_ip));
+        let use_tls = config.tls && !excluded;
 
-            if let Err(e) = result {
-                debug!("Connection from {} closed: {}", peer_addr, e);
-            }
-        });
+        info!(
+            "Accept from {} (raw: {}, check: {}, excluded: {}, tls: {})",
+            peer_addr, raw_ip, check_ip, excluded, use_tls
+        );
+
+        if use_tls {
+            let acceptor = acceptor.clone().unwrap();
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(stream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        debug!("TLS accept error from {}: {}", peer_addr, e);
+                        return;
+                    }
+                };
+                let io = TokioIo::new(tls_stream);
+                let result = http1_server::Builder::new()
+                    .preserve_header_case(true)
+                    .serve_connection(
+                        io,
+                        service_fn(move |req| handle_request(req, config.clone(), peer_addr)),
+                    )
+                    .with_upgrades()
+                    .await;
+
+                if let Err(e) = result {
+                    debug!("TLS connection from {} closed: {}", peer_addr, e);
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let result = http1_server::Builder::new()
+                    .preserve_header_case(true)
+                    .serve_connection(
+                        io,
+                        service_fn(move |req| handle_request(req, config.clone(), peer_addr)),
+                    )
+                    .with_upgrades()
+                    .await;
+
+                if let Err(e) = result {
+                    debug!("Connection from {} closed: {}", peer_addr, e);
+                }
+            });
+        }
     }
 }
 
@@ -122,7 +189,6 @@ async fn handle_request(
     }
 }
 
-/// Handle HTTP CONNECT tunnel requests.
 async fn handle_connect(
     req: Request<Incoming>,
     config: Arc<ServiceConfig>,
@@ -175,7 +241,6 @@ async fn handle_connect(
         .unwrap())
 }
 
-/// Connect to the upstream proxy and perform CONNECT tunneling; returns the tunneled stream.
 async fn connect_upstream_tunnel(host: &str, port: u16, upstream_proxy: &str) -> Result<TokioIo<hyper::upgrade::Upgraded>, BoxError> {
     let (proxy_host, proxy_port) = parse_proxy_url(upstream_proxy)
         .map_err(|e| -> BoxError { Box::new(e) })?;
@@ -213,7 +278,6 @@ async fn connect_upstream_tunnel(host: &str, port: u16, upstream_proxy: &str) ->
     Ok(TokioIo::new(upgraded))
 }
 
-/// Handle plain HTTP proxy requests (non-CONNECT).
 async fn handle_http(
     req: Request<Incoming>,
     config: Arc<ServiceConfig>,
@@ -238,7 +302,6 @@ async fn handle_http(
     }
 }
 
-/// Forward an HTTP request directly to the target server.
 async fn forward_http_direct(
     req: Request<Incoming>,
     host: &str,
@@ -291,7 +354,6 @@ async fn forward_http_direct(
     ))
 }
 
-/// Forward an HTTP proxy request to the upstream proxy as-is.
 async fn forward_http_via_proxy(
     req: Request<Incoming>,
     upstream_proxy: &str,
